@@ -3,6 +3,9 @@ const router = express.Router();
 const pool = require('../db/pool');
 const authMiddleware = require('../middleware/auth');
 const { getPostWithLikes } = require('../services/postService');
+const { createComment } = require('../services/commentService');
+const { getCommentsForPost } = require('../services/commentService');
+const { getCommentCountsForPosts } = require('../services/commentService');
 
 
 router.get('/', authMiddleware, async (req, res) => {
@@ -14,6 +17,7 @@ router.get('/', authMiddleware, async (req, res) => {
               u.city, u.state, u.preferred_language, u.date_of_birth, u.role_id
         FROM posts p
         JOIN users u ON p.author = u.id
+        ORDER BY p.created_date DESC
       `);
       const likesResult = await pool.query('SELECT post_id, username FROM likes');
 
@@ -23,16 +27,7 @@ router.get('/', authMiddleware, async (req, res) => {
         return acc;
       }, {});
 
-      const commentsResult = await pool.query(`
-        SELECT post_id, COUNT(*) AS comment_count
-        FROM comments
-        GROUP BY post_id
-      `);
-
-      const commentCountMap = commentsResult.rows.reduce((acc, { post_id, comment_count }) => {
-        acc[post_id] = parseInt(comment_count, 10);
-        return acc;
-      }, {});
+      const commentCountMap = await getCommentCountsForPosts();
 
       const postsWithLikes = postsResult.rows.map((post) => ({
         id: post.id,
@@ -85,17 +80,7 @@ router.get('/my', authMiddleware, async (req, res) => {
       return acc;
     }, {});
 
-    const commentsResult = await pool.query(`
-        SELECT post_id, COUNT(*) AS comment_count
-        FROM comments
-        GROUP BY post_id
-    `);
-
-    const commentCountMap = commentsResult.rows.reduce((acc, { post_id, comment_count }) => {
-      acc[post_id] = parseInt(comment_count, 10);
-      return acc;
-    }, {});
-
+    const commentCountMap = await getCommentCountsForPosts();
 
     const postsWithLikes = postsResult.rows.map((post) => ({
       ...post,
@@ -149,6 +134,8 @@ router.get('/:id', authMiddleware, async (req, res) => {
   }
 })
 
+// Add like to a post
+// If the post is already liked by the user, it returns a 400 error
 router.post('/:id/like', authMiddleware, async (req, res) => {
   const postId = req.params.id;
   const username = req.user.username;
@@ -170,7 +157,8 @@ router.post('/:id/like', authMiddleware, async (req, res) => {
   }
 });
 
-
+// DELETE a like from a post
+// If the like does not exist, it returns a 404 error
 router.delete('/:id/like', authMiddleware, async (req, res) => {
   const postId = req.params.id;
   const username = req.user.username;
@@ -190,83 +178,37 @@ router.delete('/:id/like', authMiddleware, async (req, res) => {
   }
 })
 
-
+// CREATE a new comment for a post
+// The comment can be a reply to another comment
 router.post('/:id/comments', authMiddleware, async (req, res) => {
   const postId = req.params.id;
-  const created_by = req.user.userId;
+  const userId = req.user.userId;
   const { content, reply_id, username_to_reply } = req.body;
 
   try {
-    const result = await pool.query(`
-      INSERT INTO comments
-      (id, post_id, created_by, reply_id, username_to_reply, content, created_date, last_modified_date)
-      VALUES (uuid_generate_v4(), $1, $2, $3, $4, $5, NOW(), NOW())
-      RETURNING *
-    `, [postId, created_by, reply_id, username_to_reply, content]);
+    const newComment = await createComment({
+      postId,
+      userId,
+      content,
+      replyId: reply_id,
+      usernameToReply: username_to_reply
+    });
 
-    const comment = result.rows[0];
-
-    const userResult = await pool.query(`
-      SELECT id, username, first_name, last_name, city, state,
-             preferred_language, date_of_birth, role_id
-      FROM users
-      WHERE id = $1
-    `, [comment.created_by]);
-
-    const user = userResult.rows[0];
-
-    const enrichedComment = {
-      ...comment,
-      created_by: user
-    };
-
-    res.status(201).json(enrichedComment);
+    res.status(201).json(newComment);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-
+// GET all comments for a post
+// Returns an array of comments with user details
 router.get('/:id/comments/all', authMiddleware, async (req, res) => {
-  const postId = req.params.id;
-
   try {
-    const commentResults = await pool.query(`
-      SELECT c.*, 
-             u.id AS user_id, u.username, u.first_name, u.last_name,
-             u.city, u.state, u.preferred_language, u.date_of_birth, u.role_id
-      FROM comments c
-      JOIN users u ON c.created_by = u.id
-      WHERE c.post_id = $1
-    `, [postId]);
-
-    if (commentResults.rowCount === 0) {
+    const comments = await getCommentsForPost(req.params.id);
+    if (comments.length === 0) {
       return res.status(404).json({ message: 'There are no comments for this post yet' });
     }
-
-    const enrichedComments = commentResults.rows.map(comment => ({
-      id: comment.id,
-      post_id: comment.post_id,
-      reply_id: comment.reply_id,
-      username_to_reply: comment.username_to_reply,
-      content: comment.content,
-      created_date: comment.created_date,
-      last_modified_date: comment.last_modified_date,
-      banned: comment.banned,
-      created_by: {
-        id: comment.user_id,
-        username: comment.username,
-        first_name: comment.first_name,
-        last_name: comment.last_name,
-        city: comment.city,
-        state: comment.state,
-        preferred_language: comment.preferred_language,
-        date_of_birth: comment.date_of_birth,
-        role_id: comment.role_id
-      }
-    }));
-
-    res.status(200).json(enrichedComments);
+    res.status(200).json(comments);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
